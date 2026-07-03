@@ -1,0 +1,11 @@
+# Sample CVE list for vulnerability prioritization
+# Lines starting with # are ignored
+# One CVE ID per line
+
+# Recent CVEs with full EPSS data
+CVE-2026-9999
+CVE-2026-9995
+CVE-2026-9994
+
+# Known exploited vulnerability (no EPSS data as it's older)
+CVE-2023-44487

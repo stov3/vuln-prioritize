@@ -1,0 +1,48 @@
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ────────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+
+# ── IDE / editor ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Secrets & local config ──────────────────────────────────────────────────────
+.env
+.env.local
+# (keep .env.example — it's the public template)
+
+# ── Runtime cache files (generated each session) ───────────────────────────────
+.rate_limit_state.json
+.exploitdb_cache.json
+.exploitdb_data.csv
+.kev_cache.json
+.github_etag_cache.json
+
+# ── Generated reports (output, not source) ─────────────────────────────────────
+vulnerability_report.json
+vulnerability_report.csv
+
+# ── Development / test artifacts ───────────────────────────────────────────────
+test_*.txt
+test_*.py
+EDGE_CASES_ANALYSIS.md
+*.bak
+
+# ── macOS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+

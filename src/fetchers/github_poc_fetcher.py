@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+GitHub PoC (Proof of Concept) Fetcher
+
+Searches GitHub for public exploits and PoCs related to CVEs.
+Uses both exact CVE ID matching and keyword-based searching.
+"""
+
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from rate_limiter import get_rate_limiter, update_rate_limit_from_response, handle_rate_limit_error
+
+# GitHub API best-practice headers
+# https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
+GITHUB_API_VERSION = "2022-11-28"
+GITHUB_ACCEPT       = "application/vnd.github+json"
+
+# ETag cache file — conditional requests that return 304 do NOT count against rate limit
+ETAG_CACHE_FILE = Path(".github_etag_cache.json")
+
+
+def _load_etag_cache() -> dict:
+    """Load ETag cache from disk."""
+    try:
+        if ETAG_CACHE_FILE.exists():
+            return json.loads(ETAG_CACHE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_etag_cache(cache: dict) -> None:
+    """Persist ETag cache to disk."""
+    try:
+        ETAG_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass
+
+
+def _github_headers(token: str = None) -> dict:
+    """Build standard GitHub API headers per best-practice docs."""
+    headers = {
+        "User-Agent":          "vuln-prioritize/1.0",
+        "Accept":              GITHUB_ACCEPT,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def get_cve_keywords(cve_id):
+    """
+    Extract potential keywords from CVE ID for broader searches.
+    
+    Examples:
+    - CVE-2026-9999 -> ["CVE-2026-9999", "vulnerability"]
+    - Extract from NVD if available in future versions
+    """
+    keywords = [cve_id]
+    # Basic year extraction (CVE-YYYY-...)
+    try:
+        year = cve_id.split('-')[1]
+        # Could add year-based keywords here
+    except:
+        pass
+    return keywords
+
+
+def is_data_repo(repo_name, description):
+    """
+    Filter out known CVE database/tracking repositories.
+    Returns True if this appears to be a data repo (not an actual exploit).
+    """
+    data_keywords = [
+        'cve-list', 'cve-tracker', 'cve-archive', 'cve-database',
+        'vulnerability-list', 'vulnerability-tracker', 'vulnerability-database',
+        'cve-monitor', 'cve-feed', 'nvd', 'awesome-cves', 'cve-data',
+        'cve-collection', 'security-advisories', 'vulnerability-data'
+    ]
+    
+    combined = f"{repo_name} {description}".lower()
+    return any(keyword in combined for keyword in data_keywords)
+
+
+def has_exploit_context(description, language):
+    """
+    Check if repo description suggests actual exploit/tool code (not just data).
+    Returns True if keywords indicate this is likely a real PoC or security tool.
+    """
+    if not description:
+        # No description is suspicious, but allow if it's code language
+        return language and language.lower() in ['python', 'bash', 'shell', 'go', 'c', 'java', 'javascript']
+    
+    exploit_keywords = [
+        'exploit', 'poc', 'proof of concept', 'proof-of-concept',
+        'rce', 'remote code execution', 'payload', 'shellcode',
+        'scanner', 'tool', 'framework', 'vulnerability',
+        'malware', 'reverse shell', 'backdoor', 'dos', 'ddos',
+        'attack', 'test', 'detection', 'vulnerable', 'bypass',
+        'injection', 'xss', 'sql', 'csrf', 'ssrf',
+        'scanning', 'checker', 'fuzzer', 'crawler'
+    ]
+    
+    description_lower = description.lower()
+    return any(keyword in description_lower for keyword in exploit_keywords)
+
+
+def search_github_poc(cve_id):
+    """
+    Search GitHub for public PoCs and exploits for a CVE.
+    
+    Uses realistic filtering:
+    - Searches in code files (not just metadata)
+    - Filters by programming language (Python, Bash, Go, etc.)
+    - Excludes known CVE database repos
+    - Requires exploit context keywords
+    - Prioritizes by stars (community validation)
+    
+    Args:
+        cve_id (str): CVE ID (e.g., "CVE-2026-9999")
+    
+    Returns:
+        dict: {
+            "found": bool,
+            "count": int,
+            "repos": [
+                {
+                    "name": str,
+                    "url": str,
+                    "stars": int,
+                    "description": str,
+                    "language": str,
+                    "poc_keywords": [str]
+                }
+            ],
+            "error": str or None
+        }
+    """
+    # Resolve token from config (determines rate-limit tier)
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).parent.parent))
+        from config import get_config
+        _cfg = get_config()
+        token = _cfg.get_github_token()
+    except Exception:
+        token = None
+
+    has_token = bool(token)
+    limiter = get_rate_limiter("github", has_api_key=has_token)
+    etag_cache = _load_etag_cache()
+
+    try:
+        # 2 targeted queries instead of 7 — in:name,description scopes the
+        # keyword to repo name/description, cutting false positives while
+        # covering the same PoC repos the language-based queries found.
+        queries = [
+            f'{cve_id} in:name,description exploit',
+            f'{cve_id} in:name,description poc',
+        ]
+        
+        repos = []
+        seen_urls = set()
+        rate_limited = False
+
+        # Use a single shared endpoint key so the local sliding window
+        # correctly accumulates all GitHub requests across all CVEs/queries
+        GITHUB_ENDPOINT = "github_search"
+        
+        for query in queries:
+            if rate_limited:
+                break  # Stop trying queries if we've hit rate limit
+            
+            try:
+                # Enforce rate limit before each query (shared window)
+                limiter.acquire(GITHUB_ENDPOINT)
+                
+                # GitHub Search API — best-practice headers + ETag conditional request
+                search_url = (
+                    f"https://api.github.com/search/repositories"
+                    f"?q={urllib.parse.quote(query)}"
+                    f"&sort=stars&order=desc&per_page=20"
+                )
+                
+                hdrs = _github_headers(token)
+                # Add ETag/If-None-Match for conditional request (304 = free, no rate-limit cost)
+                cache_key = search_url
+                if cache_key in etag_cache:
+                    hdrs["If-None-Match"] = etag_cache[cache_key]
+
+                req = urllib.request.Request(search_url, headers=hdrs)
+                
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        update_rate_limit_from_response("github", response.headers)
+                        # Cache ETag for next run
+                        etag = response.headers.get("ETag") or response.headers.get("etag")
+                        if etag:
+                            etag_cache[cache_key] = etag
+                            _save_etag_cache(etag_cache)
+                        data = json.loads(response.read().decode('utf-8'))
+                except urllib.error.HTTPError as http_err:
+                    if http_err.code == 304:
+                        # Not Modified — data unchanged, skip this query (costs nothing)
+                        continue
+                    raise
+                    
+                    for item in data.get('items', []):
+                        url = item.get('html_url')
+                        name = item.get('name', 'Unknown')
+                        description = item.get('description', '')
+                        language = item.get('language', 'Unknown')
+                        stars = item.get('stargazers_count', 0)
+                        
+                        # Skip already seen repos
+                        if url in seen_urls:
+                            continue
+                        
+                        # Skip known CVE database/tracker repos (metadata, not exploits)
+                        if is_data_repo(name, description):
+                            continue
+                        
+                        # Require exploit context for queries without explicit exploit keywords
+                        if 'language:' in query:  # Language-based queries need stronger filtering
+                            if not has_exploit_context(description, language):
+                                continue
+                        
+                        seen_urls.add(url)
+                        repos.append({
+                            'name': name,
+                            'url': url,
+                            'stars': stars,
+                            'description': description,
+                            'language': language,
+                            'poc_keywords': extract_matching_keywords(item, language)
+                        })
+            
+            except urllib.error.HTTPError as e:
+                if e.code == 429 or e.code == 403:
+                    # Rate limit hit - pass error headers so we get the exact reset time
+                    handle_rate_limit_error("github", e.code, e.headers)
+                    rate_limited = True
+                    # Don't retry further queries, just return what we have
+                    break
+                elif e.code == 422:
+                    # Bad query - skip and continue
+                    continue
+                else:
+                    # Other HTTP errors - skip this query
+                    continue
+            except Exception:
+                # Other errors - skip query and continue
+                continue
+            
+            time.sleep(0.1)
+        
+        # Sort by stars (higher = more trusted and validated)
+        repos.sort(key=lambda x: x['stars'], reverse=True)
+        repos = repos[:5]  # Top 5 most starred
+        
+        return {
+            'found': len(repos) > 0,
+            'count': len(repos),
+            'repos': repos,
+            'error': None
+        }
+    
+    except Exception as e:
+        return {
+            'found': False,
+            'count': 0,
+            'repos': [],
+            'error': f'GitHub search failed: {str(e)}'
+        }
+
+
+def extract_matching_keywords(repo_item, language):
+    """Extract keywords from repo that indicate exploit code."""
+    keywords = []
+    repo_text = (
+        f"{repo_item.get('name', '')} "
+        f"{repo_item.get('description', '')}"
+    ).lower()
+    
+    # Add language as a keyword (code language = executable, not data)
+    if language and language.lower() != 'unknown':
+        keywords.append(language.upper())
+    
+    # Check for exploit-related terms in repo
+    if 'poc' in repo_text or 'proof of concept' in repo_text:
+        keywords.append('PoC')
+    if 'exploit' in repo_text:
+        keywords.append('Exploit')
+    if 'rce' in repo_text:
+        keywords.append('RCE')
+    if 'payload' in repo_text:
+        keywords.append('Payload')
+    if 'scanner' in repo_text:
+        keywords.append('Scanner')
+    
+    return keywords if keywords else ['Code']
+
+
+def fetch_github_pocs(cve_ids):
+    """
+    Fetch GitHub PoC information for multiple CVEs.
+    
+    Args:
+        cve_ids (list): List of CVE IDs
+    
+    Returns:
+        dict: {
+            "CVE-XXXX-XXXXX": {
+                "found": bool,
+                "count": int,
+                "repos": [...],
+                "error": str or None
+            },
+            ...
+        }
+    """
+    results = {}
+    for cve_id in cve_ids:
+        results[cve_id] = search_github_poc(cve_id)
+    
+    return results
+
+
+if __name__ == "__main__":
+    # Test
+    test_cves = ["CVE-2026-9999", "CVE-2023-44487"]
+    results = fetch_github_pocs(test_cves)
+    print(json.dumps(results, indent=2))
