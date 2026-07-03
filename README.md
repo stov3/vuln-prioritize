@@ -219,11 +219,11 @@ Missing data reduces entropy by 5–10%:
 Results are **sorted by priority** (highest first) and colour-coded:
 
 ```
-Rank   CVE ID             Priority    CVSS   Severity   EPSS     KEV   PoC   Multiplier
-═══════════════════════════════════════════════════════════════════════════════════════════
-1      CVE-2023-44487     78.0        7.5    HIGH       N/A      YES   YES   1.20×
-2      CVE-2024-1234      52.8        8.8    HIGH       N/A      NO    NO    1.00×
-3      CVE-2099-9999       0.0        0.0    UNKNOWN    N/A      NO    NO    1.00×
+Rank   CVE ID             Priority    CVSS   Severity   EPSS      KEV   PoC   Multiplier
+═════════════════════════════════════════════════════════════════════════════════════════════
+1      CVE-2023-44487     94.4        7.5    HIGH       1.00      YES   YES   1.38×
+2      CVE-2024-50379     76.3        9.8    CRITICAL   0.44      NO    YES   1.20×
+3      CVE-2026-28779     30.7        6.4    MEDIUM     0.02      NO    YES   1.38×
 ```
 
 | Colour | Score | Action |
