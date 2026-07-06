@@ -74,7 +74,7 @@ python3 fluescan.py
 python3 fluescan.py --check-apis   # test all API connections
 python3 fluescan.py --setup        # configure API keys interactively
 ```
-`--explain` prints a concise deterministic explanation per CVE with an `affected:` component line plus a one-paragraph score rationale (no AI dependency).
+`--explain` prints a concise deterministic explanation per CVE with an `affected:` component line plus a one-paragraph score rationale.
 
 ---
 ## Scoring Algorithm
