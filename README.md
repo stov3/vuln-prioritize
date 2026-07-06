@@ -25,7 +25,7 @@ Each CVE is scored by pulling live data from:
 | **ExploitDB / MSF** | ExploitDB CSV + Metasploit Framework | Working exploit / Metasploit module exists |
 | **OSV fallback** | OSV.dev | Metadata/CVSS fallback when NVD is missing or delayed |
 
-Scores are combined using a weighted risk blend with KEV signal weighting and a CISA-confirmed critical floor, normalized to 0–100.
+Scores are combined using a weighted risk blend with KEV signal weighting and a CISA-confirmed exploitation boost, normalized to 0–100.
 
 ---
 
@@ -89,9 +89,10 @@ raw_score = (0.30 × cvss_norm)
           + (0.10 × exploit_norm)
 
 priority_score = raw_score × 100 × evidence_factor × exposure_weight
+               × cwe_weight × cisa_alert_weight
 
 if cisa_kev_confirmed:
-    priority_score = max(priority_score, 85)
+    priority_score = priority_score × 1.15   # proportional urgency boost, capped at 100
 ```
 
 ### Normalization Rules
@@ -103,12 +104,21 @@ if cisa_kev_confirmed:
   - `0.0` = no exploit signal
   - `0.5` = GitHub PoC only
   - `1.0` = Metasploit module present (with or without PoC)
-- **exposure_weight** (from CVSS `AV:` soft signal):
-  - `1.07` = `AV:N` (network reachable)
-  - `1.03` = `AV:A` (adjacent network)
-  - `0.96` = `AV:L` (local)
-  - `0.90` = `AV:P` (physical)
+- **exposure_weight** (from CVSS `AV:` attacker-reachability signal):
+  - `1.10` = `AV:N` (network reachable — remotely exploitable at scale)
+  - `1.00` = `AV:A` (adjacent network — requires LAN position, neutral)
+  - `0.85` = `AV:L` (local — requires existing foothold or user-assisted execution)
+  - `0.70` = `AV:P` (physical — requires on-site access)
   - `1.00` = unknown/unavailable
+- **cwe_weight** (from NVD CWE classification):
+  - `1.05` = high-impact weakness class (e.g., command injection / unsafe deserialization classes)
+  - `1.02` = medium-impact weakness class
+  - `1.00` = generic/unknown CWE
+- **cisa_alert_weight** (from CISA KEV recency context):
+  - `1.05` = added to KEV in last 30 days
+  - `1.03` = added to KEV in last 90 days
+  - `1.01` = in KEV but older
+  - `1.00` = not in CISA KEV
 
 ### Evidence Factor
 
@@ -122,7 +132,8 @@ In practice:
 - Full trust (factor 1.0) at confidence ≥ 85 — well-documented CVEs are not penalized
 - Below that, the penalty grows proportionally (e.g. confidence 57 → ×0.67)
 - CVSS from OSV fallback, missing EPSS, or failed API lookups all reduce the factor
-- The CISA KEV critical floor (85) still applies regardless — confirmed exploitation is a hard fact
+- CISA-confirmed exploitation applies a ×1.15 urgency boost — proportional, so reachability and severity still differentiate KEV entries instead of pinning them to a fixed score
+- CWE and CISA alert-context weights are intentionally bounded, so they refine priority without overwhelming core CVSS/EPSS/KEV/exploit signals
 
 ### Worked Example
 
@@ -144,10 +155,10 @@ Normalize:
   exploit_norm = 1.0
 Evidence:
   evidence_factor = 1.0   # confidence ≥ 85, full trust
-  score = 0.925 × 100 × 1.0 × 1.07 = 98.975
+  score = 0.925 × 100 × 1.0 × 1.10 = 101.75 → capped at 100
 
-Critical override (CISA-confirmed only):
-  score = max(98.975, 85) = 98.975
+KEV urgency boost (CISA-confirmed only):
+  score = min(100 × 1.15, 100) = 100
 ```
 
 ### Risk Level Interpretation
@@ -175,8 +186,8 @@ confidence = (28 × cvss_quality) + (24 × epss_quality)
 - **Errors ≠ absence**: a failed API check lowers confidence more than a verified negative result.
 - **Agreement adjustment**: +4 when ≥3 independent sources corroborate exploitation; −5 when signals conflict (critical CVSS but very weak exploitation evidence).
 - Levels: `HIGH` ≥ 85, `MEDIUM` 65–84, `LOW` < 65 (verify manually).
-- Each CVE's `--explain` output includes an `affected:` component label (product/service orientation) and a concise paragraph covering score drivers (KEV, EPSS, exploit artifacts, CVSS), attack-vector exposure, floor application, and any evidence dampening.
-- `affected_component` and `explain_summary` are exported in JSON/CSV for triage and ownership workflows.
+- Each CVE's `--explain` output includes `affected:` and `cwe:` orientation lines plus a concise paragraph covering score drivers (KEV, EPSS, exploit artifacts, CVSS), attack-vector exposure, KEV urgency boost, and evidence dampening.
+- `affected_component`, `cwe_ids`, `cwe_category`, `cwe_weight`, `cisa_alert_status`, `cisa_alert_days`, `cisa_alert_weight`, and `explain_summary` are exported in JSON/CSV for triage and ownership workflows.
 
 ---
 
@@ -188,9 +199,9 @@ Console output now shows the prioritized table and completion line only.
 ```
 Rank   CVE ID             Priority    CVSS   Severity   EPSS   AV   ExpW    KEV    PoC   Multiplier
 ══════════════════════════════════════════════════════════════════════════════════════════════════════
-1      CVE-2023-44487     98.97       7.5    HIGH       1.00   N    1.07x   YES    YES   1.38x
-2      CVE-2020-1472      85.00       5.5    MEDIUM     1.00   L    0.96x   YES    YES   1.38x
-3      CVE-2024-50379     55.50       9.8    CRITICAL   0.44   N    1.07x   NO     YES   1.20x
+1      CVE-2023-44487     99.96       7.5    HIGH       1.00   N    1.10x   YES    YES   1.38x
+2      CVE-2022-0847      87.51       7.8    HIGH       0.88   L    0.85x   YES    YES   1.69x
+3      CVE-2022-21907     84.17       9.8    CRITICAL   0.93   N    1.10x   NO     YES   1.15x
 ```
 
 - `KEV` values are explicit: `YES` (CISA confirmed), `EARLY` (VulnCheck-only), `NO` (no KEV signal).
@@ -298,8 +309,8 @@ fluescan/
 
 | File | Format | Contents |
 |------|--------|----------|
-| `fluescan_report.json` | JSON | All report fields per CVE, including `affected_component` and `explain_summary` |
-| `fluescan_report.csv` | CSV | Spreadsheet-friendly export with `affected_component` and `explain_summary` |
+| `fluescan_report.json` | JSON | All report fields per CVE, including component, CWE, CISA alert-context, and explanation fields |
+| `fluescan_report.csv` | CSV | Spreadsheet-friendly export with component, CWE, CISA alert-context, and explanation fields |
 
 Custom paths: `--output-json path.json --output-csv path.csv`
 

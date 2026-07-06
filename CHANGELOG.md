@@ -8,8 +8,14 @@ All notable changes to this project will be documented in this file.
 - **Evidence-aware score modulation** in the main priority score.
   - Source-quality blend: CVSS 28, EPSS 24, KEV 20, exploit intel 28.
   - Agreement adjustment: +4 when ≥3 independent sources corroborate exploitation; −5 on strong conflict.
-  - Internal evidence confidence now drives `evidence_factor = min(1, evidence_score/85)` before exposure weighting and KEV floor logic.
-- **Concise deterministic `--explain` mode** with one paragraph per CVE explaining score drivers (KEV/EPSS/exploit artifacts/CVSS), attack-vector exposure impact, CISA floor application, and evidence dampening when applicable.
+  - Internal evidence confidence now drives `evidence_factor = min(1, evidence_score/85)` before exposure weighting and the KEV urgency boost.
+- **CWE-aware context scoring**.
+  - Extracts NVD CWE IDs per CVE and classifies weakness profile (high-impact / medium-impact / generic).
+  - Applies bounded `cwe_weight` for tie-breaking context (`1.05` / `1.02` / `1.00`) and surfaces CWE IDs in `--explain`.
+- **CISA KEV alert-context scoring**.
+  - Derives recency context from CISA `dateAdded` and applies bounded `cisa_alert_weight` (`1.05` 30d, `1.03` 90d, `1.01` older KEV).
+  - Surfaces alert status/age in report payload fields.
+- **Concise deterministic `--explain` mode** with one paragraph per CVE explaining score drivers (KEV/EPSS/exploit artifacts/CVSS), attack-vector exposure impact, KEV urgency boost, and evidence dampening when applicable.
 - **Affected component orientation** in explain output.
   - `--explain` now includes an `affected:` line per CVE to orient testers toward the vulnerable product/service/component.
   - Component extraction prefers NVD CPE product/vendor labels, with fallback to NVD description and OSV summary when needed.
@@ -19,10 +25,13 @@ All notable changes to this project will be documented in this file.
 - **Single-score design preserved**: priority score remains the only headline score.
 - Explanation payload simplified: `explain_summary` now contains the full operator-facing explanation paragraph (JSON/CSV).
 - Report payload now includes `affected_component` in JSON/CSV for downstream triage and assignment workflows.
+- Report payload now includes `cwe_ids`, `cwe_category`, `cwe_weight`, `cisa_alert_status`, `cisa_alert_days`, and `cisa_alert_weight`.
 - Fetch pipeline now runs independent source pulls concurrently; OSV fallback still runs after CVSS fetch for missing scores.
+- Attack-vector weighting now follows attacker reachability more aggressively (`N=1.10`, `A=1.00`, `L=0.85`, `P=0.70`).
 
 ### Removed
 - Redundant multi-line explain dump (`components`/`multipliers`/reason list style output) in favor of concise narrative output.
+- Hard 85-point CISA KEV floor, replaced by a proportional `cisa_kev_boost` (`×1.15`).
 
 ## [0.1.3-alpha] — 2026-07-03
 

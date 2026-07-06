@@ -20,6 +20,7 @@ import json
 import re
 import sys
 import textwrap
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
@@ -177,23 +178,24 @@ def extract_attack_vector(cvss_data: Dict[str, Any]) -> str:
 
 
 def attack_vector_exposure_weight(attack_vector: str) -> float:
-    """Return a soft exposure weight from CVSS AV metric.
+    """Return an exposure weight from CVSS AV metric based on attacker reach.
 
-    This signal intentionally has small impact and is used as a nudge:
-    - N (Network): more internet-exposed potential
-    - A (Adjacent): somewhat externally reachable
-    - L (Local): likely more internal preconditioned
-    - P (Physical): generally harder to exploit remotely
+    The harder a vulnerability is to reach, the less it should drive
+    remediation urgency:
+    - N (Network): remotely exploitable at scale, internet-exposed potential
+    - A (Adjacent): requires LAN/adjacent-network position — neutral
+    - L (Local): requires an existing foothold or user-assisted execution
+    - P (Physical): requires on-site physical access — lowest urgency
     """
     av = (attack_vector or "UNKNOWN").upper()
     if av == "N":
-        return 1.07
+        return 1.10
     if av == "A":
-        return 1.03
+        return 1.00
     if av == "L":
-        return 0.96
+        return 0.80
     if av == "P":
-        return 0.90
+        return 0.70
     return 1.00
 
 
@@ -340,6 +342,94 @@ def extract_affected_component(cvss_data: Dict[str, Any]) -> str:
     return ""
 
 
+def extract_cwe_signals(cvss_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract CWE IDs and derive a small, bounded CWE risk weight."""
+    cwe_ids: List[str] = []
+    for weakness in cvss_data.get("weaknesses", []):
+        for desc in weakness.get("description", []):
+            value = str(desc.get("value", "")).upper()
+            match = re.search(r"CWE-\d+", value)
+            if match:
+                cwe = match.group(0)
+                if cwe not in cwe_ids:
+                    cwe_ids.append(cwe)
+
+    if not cwe_ids:
+        return {
+            "cwe_ids": [],
+            "cwe_category": "UNKNOWN",
+            "cwe_weight": 1.00,
+        }
+
+    # Small taxonomy for triage context; capped to keep score stable.
+    high_impact = {
+        "CWE-78", "CWE-89", "CWE-94", "CWE-287", "CWE-306", "CWE-502", "CWE-918", "CWE-119",
+    }
+    medium_impact = {
+        "CWE-79", "CWE-22", "CWE-200", "CWE-352", "CWE-416", "CWE-125", "CWE-862",
+    }
+
+    category = "GENERIC"
+    cwe_weight = 1.00
+    if any(cwe in high_impact for cwe in cwe_ids):
+        category = "HIGH-IMPACT"
+        cwe_weight = 1.05
+    elif any(cwe in medium_impact for cwe in cwe_ids):
+        category = "MEDIUM-IMPACT"
+        cwe_weight = 1.02
+
+    return {
+        "cwe_ids": cwe_ids,
+        "cwe_category": category,
+        "cwe_weight": cwe_weight,
+    }
+
+
+def extract_cisa_alert_signal(cve_id: str, cisa_kev_results: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive a mild recency signal from CISA KEV dateAdded for current-alert context."""
+    kev = cisa_kev_results.get("found", {}).get(cve_id.upper())
+    if not kev:
+        return {
+            "cisa_alert_status": "NONE",
+            "cisa_alert_days": -1,
+            "cisa_alert_weight": 1.00,
+        }
+
+    date_added = str(kev.get("dateAdded", "")).strip()
+    if not date_added:
+        return {
+            "cisa_alert_status": "KEV",
+            "cisa_alert_days": -1,
+            "cisa_alert_weight": 1.01,
+        }
+
+    try:
+        added = datetime.strptime(date_added, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        days = max(0, int((datetime.now(timezone.utc) - added).days))
+    except ValueError:
+        return {
+            "cisa_alert_status": "KEV",
+            "cisa_alert_days": -1,
+            "cisa_alert_weight": 1.01,
+        }
+
+    if days <= 30:
+        status = "RECENT_30D"
+        weight = 1.05
+    elif days <= 90:
+        status = "RECENT_90D"
+        weight = 1.03
+    else:
+        status = "KEV"
+        weight = 1.01
+
+    return {
+        "cisa_alert_status": status,
+        "cisa_alert_days": days,
+        "cisa_alert_weight": weight,
+    }
+
+
 def extract_github_poc_data(github_results: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extract GitHub PoC data for analysis.
@@ -447,6 +537,8 @@ def calculate_priority_breakdown(
     github_poc_found: bool = False,
     metasploit_found: bool = False,
     evidence_factor: float = 1.0,
+    cwe_weight: float = 1.0,
+    cisa_alert_weight: float = 1.0,
 ) -> Dict[str, Any]:
     """Return deterministic, verbose score breakdown for explain mode."""
     cvss_norm = min(max(cvss_score / 10.0, 0.0), 1.0) if cvss_score > 0 else 0.0
@@ -467,10 +559,15 @@ def calculate_priority_breakdown(
     raw_score = contrib_cvss + contrib_epss + contrib_kev + contrib_exploit
 
     evidence_factor = min(max(evidence_factor, 0.0), 1.0)
+    cwe_weight = min(max(cwe_weight, 0.95), 1.08)
+    cisa_alert_weight = min(max(cisa_alert_weight, 0.98), 1.08)
 
     exposure_weight = attack_vector_exposure_weight(attack_vector)
-    pre_floor_score = raw_score * 100.0 * evidence_factor * exposure_weight
-    final_score = max(pre_floor_score, 85.0) if cisa_confirmed_kev else pre_floor_score
+    pre_boost_score = raw_score * 100.0 * evidence_factor * exposure_weight * cwe_weight * cisa_alert_weight
+    # CISA-confirmed exploitation is a strong proportional boost, not a fixed
+    # override: reachability, severity, and evidence still shape the result.
+    kev_boost = 1.15 if cisa_confirmed_kev else 1.0
+    final_score = pre_boost_score * kev_boost
     final_score = min(max(final_score, 0.0), 100.0)
 
     return {
@@ -489,8 +586,10 @@ def calculate_priority_breakdown(
         "raw_score": round(raw_score, 4),
         "evidence_factor": round(evidence_factor, 4),
         "exposure_weight": round(exposure_weight, 4),
-        "cisa_floor_applied": bool(cisa_confirmed_kev and pre_floor_score < 85.0),
-        "pre_floor_score": round(pre_floor_score, 4),
+        "cwe_weight": round(cwe_weight, 4),
+        "cisa_alert_weight": round(cisa_alert_weight, 4),
+        "cisa_kev_boost": round(kev_boost, 4),
+        "pre_boost_score": round(pre_boost_score, 4),
         "final_score": round(final_score, 4),
     }
 
@@ -644,15 +743,34 @@ def build_explanation(cve: Dict[str, Any], evidence: Dict[str, Any]) -> str:
     expw = float(cve.get("exposure_weight", 1.0))
     av_phrases = {
         "N": "Network-reachable (AV:N) raises exposure",
-        "A": "Adjacent-network access (AV:A) slightly raises exposure",
-        "L": "Local access required (AV:L) lowers exposure",
-        "P": "Physical access required (AV:P) lowers exposure",
+        "A": "Adjacent-network access required (AV:A) keeps exposure neutral",
+        "L": "Local access required (AV:L) — attacker needs an existing foothold — lowers urgency",
+        "P": "Physical access required (AV:P) — attacker must be on site — strongly lowers urgency",
     }
     if av in av_phrases:
         parts.append(f"{av_phrases[av]} (x{expw:.2f}).")
 
-    if br.get("cisa_floor_applied"):
-        parts.append("Raised to the 85-point floor reserved for CISA-confirmed exploitation.")
+    cwe_category = str(cve.get("cwe_category", "UNKNOWN"))
+    cwe_ids = cve.get("cwe_ids") or []
+    cwe_weight = float(br.get("cwe_weight", 1.0))
+    if cwe_ids and cwe_weight > 1.001:
+        shown = ", ".join(cwe_ids[:2])
+        if len(cwe_ids) > 2:
+            shown += f" (+{len(cwe_ids) - 2})"
+        parts.append(f"CWE profile {cwe_category} ({shown}) nudges score (x{cwe_weight:.2f}).")
+
+    cisa_alert_status = str(cve.get("cisa_alert_status", "NONE"))
+    cisa_alert_weight = float(br.get("cisa_alert_weight", 1.0))
+    cisa_alert_days = int(cve.get("cisa_alert_days", -1))
+    if cisa_alert_status != "NONE" and cisa_alert_weight > 1.001:
+        if cisa_alert_status in {"RECENT_30D", "RECENT_90D"} and cisa_alert_days >= 0:
+            parts.append(f"CISA KEV recency signal ({cisa_alert_days} days since addition) boosts urgency (x{cisa_alert_weight:.2f}).")
+        else:
+            parts.append(f"CISA KEV presence adds mild alert context (x{cisa_alert_weight:.2f}).")
+
+    kev_boost = float(br.get("cisa_kev_boost", 1.0))
+    if kev_boost > 1.001:
+        parts.append(f"Confirmed exploitation applies a x{kev_boost:.2f} urgency boost.")
 
     # Evidence clause: only when weaker evidence actually dampened the score.
     ev_factor = float(br.get("evidence_factor", 1.0))
@@ -696,6 +814,12 @@ def print_explanations(report: List[Dict[str, Any]]) -> None:
         component = str(cve.get("affected_component", "")).strip()
         if component:
             print(f"{Colors.BRIGHT_ORANGE}affected{Colors.RESET}: {Colors.BRIGHT_WHITE}{component}{Colors.RESET}")
+        cwe_ids = cve.get("cwe_ids") or []
+        if cwe_ids:
+            shown = ", ".join(cwe_ids[:3])
+            if len(cwe_ids) > 3:
+                shown += f" (+{len(cwe_ids) - 3} more)"
+            print(f"{Colors.BRIGHT_ORANGE}cwe{Colors.RESET}: {Colors.BRIGHT_WHITE}{shown}{Colors.RESET}")
         for line in textwrap.wrap(str(cve.get("explain_summary", "")), width=78):
             print(f"{Colors.SMOKE}{line}{Colors.RESET}")
     print(f"{Colors.DARK_SMOKE}{'-' * 78}{Colors.RESET}")
@@ -740,6 +864,8 @@ def generate_report(
         cvss_score, cvss_severity = extract_cvss_score(cvss_data)
         attack_vector = extract_attack_vector(cvss_data)
         affected_component = extract_affected_component(cvss_data)
+        cwe = extract_cwe_signals(cvss_data)
+        cisa_alert = extract_cisa_alert_signal(cve_id, cisa_kev_results)
         epss_score, epss_percentile = extract_epss_score(epss_data)
         in_cisa_kev, in_vulncheck_kev, kev_strength = get_kev_signals(
             cve_id,
@@ -761,6 +887,12 @@ def generate_report(
             "cve_id": cve_upper,
             "priority_score": 0.0,  # set after data-quality-aware scoring below
             "affected_component": affected_component,
+            "cwe_ids": cwe["cwe_ids"],
+            "cwe_category": cwe["cwe_category"],
+            "cwe_weight": cwe["cwe_weight"],
+            "cisa_alert_status": cisa_alert["cisa_alert_status"],
+            "cisa_alert_days": cisa_alert["cisa_alert_days"],
+            "cisa_alert_weight": cisa_alert["cisa_alert_weight"],
             "cvss_score": cvss_score,
             "cvss_severity": cvss_severity,
             "attack_vector": attack_vector,
@@ -801,6 +933,8 @@ def generate_report(
             github_data.get("found", False),
             msf_data.get("found", False),
             evidence_factor,
+            cwe["cwe_weight"],
+            cisa_alert["cisa_alert_weight"],
         )
         record["priority_score"] = round(breakdown["final_score"], 2)
         record["score_breakdown"] = breakdown
@@ -824,7 +958,7 @@ def write_json_report(filepath: str, report: List[Dict[str, Any]]) -> None:
 def write_csv_report(filepath: str, report: List[Dict[str, Any]]) -> None:
     """Write report to CSV file with all fields including exploit data."""
     fieldnames = [
-        "cve_id", "priority_score", "affected_component", "cvss_score", "cvss_severity", "attack_vector", "exposure_weight",
+        "cve_id", "priority_score", "affected_component", "cwe_ids", "cwe_category", "cwe_weight", "cisa_alert_status", "cisa_alert_days", "cisa_alert_weight", "cvss_score", "cvss_severity", "attack_vector", "exposure_weight",
         "epss_score", "epss_percentile", "epss_prev_7d", "epss_delta_7d",
         "in_kev", "in_vulncheck_kev", "kev_status", "kev_signal_strength",
         "github_poc_found", "github_poc_count",
